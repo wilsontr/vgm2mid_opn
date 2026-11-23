@@ -1,156 +1,158 @@
 # vgm2mid_opn
 
-Converts [VGM/VGZ](https://vgmrips.net/wiki/VGM_Specification) chip logs to
-Standard MIDI Files. Decodes the Yamaha YM2203 (NEC PC-9801 FM sound boards) and
-the first three FM channels of the YM2608 and YM2612.
+Converts [VGM/VGZ](https://vgmrips.net/wiki/VGM_Specification) sound chip logs to Standard MIDI Files (.mid).
+
+The tool decodes:
+* The Yamaha YM2203 (used on NEC PC-9801 sound boards)
+* The first three FM channels of the Yamaha YM2608 and YM2612
 
 ```bash
 python3 vgm2mid_opn.py "12 Mako's Theme.vgz"     # -> "12 Mako's Theme.mid"
-python3 vgm2mid_opn.py *.vgz -o midi/            # batch into a directory
+python3 vgm2mid_opn.py *.vgz -o midi/            # batch process into a directory
 ```
 
-Output is format 1: one track per chip channel (`FM 1..3`, `SSG A..C`), plus a
-percussion track on MIDI channel 10 when the mixer enables SSG noise.
+The output file is a Format 1 MIDI file:
+* Each chip channel receives its own track (`FM 1..3`, `SSG A..C`).
+* When the chip mixer enables SSG noise, an extra percussion track is written to MIDI channel 10.
 
 ## Requirements
 
-Python 3.8 or newer. Standard library only.
+* Python 3.8 or newer
+* Python standard library only (no external dependencies)
 
 ## Options
 
-| Option | |
+| Option | Description |
 | --- | --- |
-| `-o, --out` | output file (one input) or directory (several) |
-| `--loops N` | how many times to play the looped section (default 1) |
-| `--stats` | per-channel summary of what was decoded |
-| `--programs 4,38,4` | GM programs for FM 1..3, overriding the heuristic |
-| `--noise-drum N` | force one GM drum note for SSG noise instead of choosing by noise period |
-| `--no-drums` | drop SSG noise instead of mapping it to the drum channel |
-| `--no-release` | end notes at key-off instead of holding through the carrier release |
+| `-o, --out` | Output file path (single input) or output directory (multiple inputs) |
+| `--loops N` | Number of times to play looped sections (default: 1) |
+| `--stats` | Print a per-channel summary of decoded events |
+| `--programs 4,38,4` | General MIDI program numbers for FM channels 1 to 3, overriding the default heuristic |
+| `--noise-drum N` | Map all SSG noise to a fixed General MIDI drum note number instead of selecting by noise period |
+| `--no-drums` | Drop SSG noise entirely instead of writing drum notes |
+| `--no-release` | Cut notes off immediately at key-off instead of extending them through the carrier release phase |
 
 ## Decoding
 
-**FM pitch** is derived from the 11-bit F-number and 3-bit block:
+### FM Pitch
+
+FM note frequency is calculated from the 11-bit F-number (`FN`), the 3-bit octave block (`B`), and the chip master clock (`fM`):
 
 ```
 fn = FN * fM / (144 * 2^(20 - B))
 ```
 
-`0xA4` holds the F-number's top three bits in bits 0-2 and the block in bits 3-5.
-A check that notes land on semitones does not detect a constant factor error in
-the formula, such as an octave offset, so the test suite pins the absolute value:
-`fnum 1040, block 4 == 440 Hz`.
+In the YM2203 register set, register `0xA4` holds the top three bits of the F-number in bits 0–2, and the octave block in bits 3–5.
 
-**SSG pitch** is derived from the 12-bit tone period. The SSG is clocked at half
-the FM clock, from the chip's /6 prescaler:
+Checking that notes land on semitones does not catch constant scaling errors, such as an octave offset. To prevent this, the test suite verifies an absolute reference value: `fnum 1040, block 4 == 440 Hz`.
+
+### SSG Pitch
+
+SSG pitch is derived from the 12-bit tone period (`TP`). An internal /6 prescaler runs the SSG section at half the master FM clock rate (`fM / 2`):
 
 ```
 f = (fM / 2) / (16 * TP)
 ```
 
-**FM level** is the Total Level of the operators that are carriers under the
-channel's algorithm (0-3: operator 4; 4: operators 3 and 4; 5 and 6: operators 2,
-3 and 4; 7: all four). **SSG level** is the volume register, which also gates the
-note: the SSG has no key-on bit.
+### Volume and Velocity
 
-**SSG noise** is decoded from the mixer register. A channel in noise mode does not
-produce the tone-period pitch. The tone period is still latched while noise is
-selected, because drivers write it before switching back and the chip sounds it on
-the switch. Noise output becomes drum hits on MIDI channel 10 at a maximum rate of
-one per 25 ms, with velocity taken from the volume register. The noise period
-selects the drum: ≤10 crash cymbal 2 (note 57, "A2" in Logic's drum map), ≤18 open
-hi-hat, ≤26 snare, otherwise low floor tom.
+* **FM Channels**: Velocity is calculated from the Total Level (TL) settings of the operators acting as carriers. Which operators are carriers depends on the channel's algorithm:
+  * Algorithms 0–3: Operator 4
+  * Algorithm 4: Operators 3 and 4
+  * Algorithms 5 and 6: Operators 2, 3, and 4
+  * Algorithm 7: All four operators
+* **SSG Channels**: Velocity is read directly from each channel's volume register. Because the SSG has no key-on bit, changes in this volume register also gate note-on and note-off events.
 
-**Timing** is 120 BPM at 480 PPQ, so one tick is 1.04 ms and absolute times match
-the log. A MIDI file's length equals the VGM's total sample count.
+### SSG Noise
 
-**Two-byte register writes** are coalesced. Drivers write 16-bit values one byte
-at a time, a few samples apart. Applying the intermediate state produces
-octave-scale pitch jumps and spurious retriggers, so only the last write of a
-burst is applied; the earlier bytes are still latched.
+SSG noise state is read from the mixer register. When a channel is switched to noise mode, tone generation stops for that channel.
 
-**Note length** runs to key-off plus the carrier's release time from `SL`/`RR`,
-capped at 400 ms and clamped so a note never overlaps the next note on the same
-channel. `--no-release` ends notes at key-off instead.
+The channel's tone period register continues to latch writes made while noise mode is active. Sound drivers frequently update the tone period register right before switching back to tone mode, and the chip outputs the latched pitch as soon as the switch occurs.
+
+Noise events are converted into MIDI drum notes on channel 10:
+* Note velocity is read from the channel volume register.
+* Events are rate-limited to a maximum of one drum hit per 25 ms.
+* The drum note is chosen based on the noise period:
+  * 0–10: Crash Cymbal 2 (MIDI note 57, labeled "A2" in Logic's drum map)
+  * 11–18: Open Hi-Hat (MIDI note 46)
+  * 19–26: Snare (MIDI note 38)
+  * 27+: Low Floor Tom (MIDI note 41)
+
+### Timing
+
+MIDI files are written at 120 BPM with a resolution of 480 pulses per quarter note (PPQ).
+
+Under these settings, one MIDI tick is approximately 1.04 ms. Timestamps match the sample clock of the source log, and the total duration of the MIDI file matches the total sample count in the VGM file.
+
+### Multi-Byte Register Writes
+
+Sound drivers write 16-bit values as two single-byte writes separated by a few audio samples.
+
+Applying intermediate values immediately causes octave-wide pitch jumps and false note retriggers. To avoid this, the decoder coalesces rapid writes: earlier bytes update internal chip state (latched), but note and pitch changes are applied only on the final write of a burst.
+
+### Note Duration
+
+A note begins at key-on and extends past key-off through the carrier operator's release phase.
+
+The release duration is calculated from the Sustain Level (`SL`) and Release Rate (`RR`) registers. This release tail is capped at 400 ms and clamped so it never overlaps the next note on the same channel. The `--no-release` flag disables this tail, cutting notes off immediately at key-off.
 
 ## Compatibility
 
-The npm `vgm2midi` package decodes SN76489, YM2612, YM2413, YM2151 and AY-8910. It
-does not implement the YM2203; on a YM2203 log it writes a 14-byte `MThd` chunk
-declaring zero tracks, which most players reject.
-
-Paul Jensen's `vgm2mid` decodes the YM2203. It is a 32-bit VB6 application with a
-GUI and no command line, requires the VB6 runtime, and requires Windows codepage
-1252 for correct output timing.
+* **npm `vgm2midi`**: Decodes SN76489, YM2612, YM2413, YM2151, and AY-8910. It does not support the YM2203. When processing a YM2203 log, it generates an empty 14-byte `MThd` header with zero tracks, which most MIDI players reject.
+* **Paul Jensen's `vgm2mid`**: Decodes the YM2203. It is a 32-bit Windows GUI program written in Visual Basic 6 with no command-line interface. It requires the VB6 runtime and requires Windows code page 1252 to produce correct timing.
 
 ## Verification
 
-* **Pitch**: 1881 of 1882 note-ons (99.95%) across three PC-98 rips match the
-  frequency implied by the registers at that instant, recomputed by a separate
-  decoder written from the specification.
-* **Absolute tuning**: a synthetic log with `fnum 1040, block 4` renders at
-  440.3 Hz in VGMPlay.
-* **Length**: 39.716 / 31.788 / 39.049 s rendered from the logs, against
-  39.72 / 31.79 / 39.05 s of MIDI.
-* **Structure**: every output parses with an independent SMF reader; all notes
-  paired, no overlaps, `MTrk` and end-of-track correct in every track.
+* **Pitch accuracy**: Across three PC-98 rips, 1,881 of 1,882 note-on events (99.95%) match the frequency calculated by an independent reference decoder written directly from the hardware specification.
+* **Absolute tuning**: A synthetic test log using `fnum 1040, block 4` renders at 440.3 Hz in VGMPlay.
+* **Duration**: Rendered audio lengths from source logs match the generated MIDI file lengths:
+  * Log 1: 39.716 s audio vs. 39.72 s MIDI
+  * Log 2: 31.788 s audio vs. 31.79 s MIDI
+  * Log 3: 39.049 s audio vs. 39.05 s MIDI
+* **File structure**: All outputs validate under an independent Standard MIDI File parser. Note-on and note-off events are properly paired without overlaps, and `MTrk` chunks and end-of-track markers are structurally correct across all tracks.
 
 ## Limitations
 
-* Only FM channels 1-3 are decoded: all of a YM2203, the first half of a YM2608.
-  ADPCM and DAC percussion are not decoded.
-* Envelope generators are not modelled. Note boundaries and the release estimate
-  described above are the only envelope handling; attacks and decays are not
-  reproduced.
-* The GM program per FM channel and the drum chosen for noise are heuristics,
-  overridable with `--programs` and `--noise-drum`. Neither affects timing.
-* SSG hardware envelopes (bit 4 of the volume register) are treated as full
-  volume rather than modelled.
+* **Channels**: Only FM channels 1 to 3 are decoded. This covers the entire FM section of the YM2203 and the first half of the YM2608. ADPCM audio and DAC percussion are not decoded.
+* **Envelopes**: Envelope generators are not fully modeled. Attack and decay curves are omitted; the decoder only tracks note boundaries and carrier release tails.
+* **Instrument assignment**: General MIDI program numbers for FM channels and drum note selections for noise are heuristics. These can be overridden using `--programs` and `--noise-drum`. Overriding them does not affect timing.
+* **SSG hardware envelopes**: When bit 4 of an SSG volume register is set (enabling hardware envelope mode), the decoder treats the channel as full volume rather than modeling the envelope pattern.
 
 ## Tests
 
+Run the test suite with Python's built-in `unittest` module:
+
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m pytest tests -q          # if pytest is installed
 ```
 
-The tests generate their VGM files in-process from the specification. No game data
-is required.
+If `pytest` is installed, it can also be run directly:
 
-## Related tools
+```bash
+python3 -m pytest tests -q
+```
 
-* [VGMPlay / libvgm](https://github.com/ValleyBell/libvgm) — reference player for
-  VGM logs.
-* [vgm2mid](https://vgmrips.net/wiki/Vgm2mid) — Paul Jensen's converter with
-  Valley Bell's updates. Windows only.
-* [jvgmtrans](https://github.com/dksrphm/jvgmtrans) — Java, cross-platform,
-  decodes the YM2203.
-* [VGMTrans](https://github.com/vgmtrans/vgmtrans) and
-  [VGMToolbox](https://github.com/Manicsteiner/VGMToolbox) — convert proprietary
-  sequence formats; neither reads VGM register logs.
+The test suite generates synthetic VGM data streams in memory from the specification. No external game files or audio dumps are required.
+
+## Related Tools
+
+* [VGMPlay / libvgm](https://github.com/ValleyBell/libvgm) — Reference player for VGM logs.
+* [vgm2mid](https://vgmrips.net/wiki/Vgm2mid) — Paul Jensen's converter with updates by Valley Bell (Windows only).
+* [jvgmtrans](https://github.com/dksrphm/jvgmtrans) — Cross-platform Java converter that decodes the YM2203.
+* [VGMTrans](https://github.com/vgmtrans/vgmtrans) and [VGMToolbox](https://github.com/Manicsteiner/VGMToolbox) — Converters for proprietary game sequence formats. Neither tool reads VGM register logs.
 
 ## Credits
 
-This decoder was written from specifications and rendered audio. No code from the
-projects below is included.
+This decoder was written from hardware specifications and verified against rendered audio. It does not include code from the projects listed below.
 
-* **The VGM specification** ([vgmrips.net](https://vgmrips.net/wiki/VGM_Specification))
-  — header layout, the command table, data blocks, and the rule that every pointer
-  in the header is relative to the field containing it. The parser follows this
-  document.
-* **Yamaha YM2203 Application Manual**, as quoted in the
-  [`soundlog`](https://docs.rs/soundlog/latest/soundlog/chip/fnumber/struct.OpnSpec.html)
-  crate's `OpnSpec` documentation — the F-number formula and its prescaler.
-* **[ymfm](https://github.com/aaronsgiles/ymfm)** by Aaron Giles (BSD-3-Clause),
-  read via 86Box's vendored copy — the relationship between the master clock and
-  the SSG clock, which sets the SSG's tuning.
-* **Paul Jensen** — author of the original `vgm2mid`.
-* **Valley Bell** — maintainer of `vgm2mid` and of libvgm/VGMPlay. The
-  chip-support notes in the `vgm2mid` update changelog list which chips are
-  covered, and VGMPlay was the renderer used to verify this converter's output.
+* **[VGM Specification](https://vgmrips.net/wiki/VGM_Specification)** — Header structure, command tables, data block formats, and the specification rule that header pointers are relative to their field offset.
+* **Yamaha YM2203 Application Manual** (quoted in the [`soundlog`](https://docs.rs/soundlog/latest/soundlog/chip/fnumber/struct.OpnSpec.html) crate documentation) — F-number formula and prescaler ratios.
+* **[ymfm](https://github.com/aaronsgiles/ymfm)** by Aaron Giles (BSD-3-Clause, referenced via 86Box) — Clock relationship between the master clock and the SSG clock.
+* **Paul Jensen** — Author of the original `vgm2mid`.
+* **Valley Bell** — Maintainer of `vgm2mid` and `libvgm`/`VGMPlay`. The `vgm2mid` changelog provided chip support references, and VGMPlay served as the reference audio renderer for validation.
 
-## Licence
+## License
 
-MIT — see [LICENSE](LICENSE). This covers the source only. It does not cover VGM
-files, game audio, or rendered audio of game music, which remain the property of
-their respective rights holders.
+MIT — see [LICENSE](LICENSE).
+
+This license covers the source code only. It does not cover VGM files, game audio data, or rendered audio recordings of game music, which remain the property of their respective copyright holders.
