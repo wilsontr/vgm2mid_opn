@@ -221,3 +221,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Game data, rendered audio and converted output are not ours to license
+*.vgm
+*.vgz
+ref/
+midi/
+*.wav
+
+# Built third-party players (libvgm) — see the README; not redistributed here
+tools/
